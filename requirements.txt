@@ -1,4 +1,6 @@
 streamlit
 pandas
+openpyxl
 pillow
-pytesseract
+torch
+easyocr
