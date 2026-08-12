@@ -1,26 +1,51 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import datetime
+from datetime import datetime, time
 import re
 from PIL import Image
 import pytesseract
+import io
 
-# Sayfa Ayarları
+# ---------------------------------------------------------
+# SAYFA VE TEMA AYARLARI
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="Gerçek Dekont Okuyucu",
-    page_icon="🧾",
+    page_title="Otomatik Vardiyalı Dekont Portalı",
+    page_icon="⏰",
     layout="wide"
 )
 
-# SQLite Veritabanı
-conn = sqlite3.connect("dekontlar.db", check_same_thread=False)
+st.markdown("""
+    <style>
+    .report-card-ready {
+        background-color: #DCFCE7;
+        border: 2px solid #16A34A;
+        padding: 18px;
+        border-radius: 10px;
+        margin-bottom: 15px;
+    }
+    .report-card-waiting {
+        background-color: #FEF3C7;
+        border: 2px solid #D97706;
+        padding: 18px;
+        border-radius: 10px;
+        margin-bottom: 15px;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------
+# VERİTABANI BAĞLANTISI
+# ---------------------------------------------------------
+conn = sqlite3.connect("dekontlar_v3.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS dekontlar (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tarih TEXT,
         saat TEXT,
+        islem_yoni TEXT,
         gonderen TEXT,
         alici TEXT,
         banka TEXT,
@@ -31,13 +56,11 @@ cursor.execute('''
 ''')
 conn.commit()
 
-# --- GELİŞMİŞ METİN AYRIŞTIRMA (REGEX) ---
-def metinden_veri_ayikla(metin):
-    # 1. IBAN Bulma (TR ile başlayan 26 haneli yapı)
+# Metin Ayrıştırma Fonksiyonu
+def metinden_veri_ayikla(metin, yon="Gelen (Girdi)"):
     iban_match = re.search(r'TR\s?\d{2}(?:\s?\d{4}){5}', metin, re.IGNORECASE)
     iban = iban_match.group(0).upper().replace(" ", "") if iban_match else "IBAN Bulunamadı"
 
-    # 2. Tutar Bulma (Örn: 150.000,00 TL / 1.500 TL / 4500.50 TL)
     tutar = 0.0
     tutar_match = re.search(r'(\d{1,3}(?:\.\d{3})*(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*(?:TL|TRY|₺)', metin, re.IGNORECASE)
     if tutar_match:
@@ -47,11 +70,9 @@ def metinden_veri_ayikla(metin):
         except:
             tutar = 0.0
 
-    # 3. Saat Bulma (Örn: 21:57 veya 09:15)
     saat_match = re.search(r'\b([01]?\d|2[0-3]):[0-5]\d\b', metin)
     saat = saat_match.group(0) if saat_match else datetime.now().strftime("%H:%M")
 
-    # 4. Banka Algılama
     m_lower = metin.lower()
     banka = "Diğer / Belirtilmedi"
     if "akbank" in m_lower: banka = "Akbank"
@@ -59,23 +80,15 @@ def metinden_veri_ayikla(metin):
     elif "iş bank" in m_lower or "isbank" in m_lower: banka = "İş Bankası"
     elif "ziraat" in m_lower: banka = "Ziraat Bankası"
     elif "yapı kredi" in m_lower or "yapikredi" in m_lower: banka = "Yapı Kredi"
-    elif "qnb" in m_lower or "finansbank" in m_lower: banka = "QNB Finansbank"
 
-    # 5. Gönderen / Alıcı Satır Taraması
     satirlar = [s.strip() for s in metin.split('\n') if len(s.strip()) > 2]
-    gonderen = "Algılanamadı"
-    alici = "Sıla Sarı" # Varsayılan alıcı hedefi
-
-    for s in satirlar:
-        if "gönderen" in s.lower() or "gonderen" in s.lower() or "hesap sahibi" in s.lower():
-            gonderen = s
-            break
-    if gonderen == "Algılanamadı" and len(satirlar) > 0:
-        gonderen = satirlar[0]
+    gonderen = satirlar[0] if len(satirlar) > 0 else "Bilinmeyen Gönderen"
+    alici = "Sıla Sarı"
 
     return {
         "tarih": datetime.now().strftime("%Y-%m-%d"),
         "saat": saat,
+        "islem_yoni": yon,
         "gonderen": gonderen,
         "alici": alici,
         "banka": banka,
@@ -83,69 +96,118 @@ def metinden_veri_ayikla(metin):
         "tutar": tutar
     }
 
-# --- ARAYÜZ ---
-st.title("🧾 Gerçek Otomatik Dekont Okuyucu")
-st.write("Dekont ekran görüntüsünü yükleyin. Sistem içerikteki **gerçek** metni okuyup veritabanına işleyecektir.")
+# Excel Oluşturucu Yardımcı Fonksiyon
+def excel_raporu_olustur(df_subset, rapor_basligi):
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_subset.to_excel(writer, sheet_name='Dekont_Listesi', index=False)
+        iban_summary = df_subset.groupby(['alici', 'banka', 'iban', 'islem_yoni'])['tutar'].sum().unstack(fill_value=0).reset_index()
+        iban_summary.to_excel(writer, sheet_name='IBAN_Ozet_Bakiye', index=False)
+    return buffer.getvalue()
 
-yuklenen_dosya = st.file_uploader(
-    "📸 Dekont Görseli Yükleyin (PNG, JPG, JPEG)", 
-    type=["png", "jpg", "jpeg"]
-)
+# ---------------------------------------------------------
+# ARAYÜZ & DEKONT YÜKLEME
+# ---------------------------------------------------------
+st.title("💳 Vardiyalı & Saatlik Hazır Dekont Portalı")
+
+with st.sidebar:
+    st.header("⚙️ Dekont Yönü")
+    islem_yoni = st.radio("Yön Seçin:", ["🟢 Gelen Para (Girdi)", "🔴 Giden Para (Çıktı)"])
+    islem_yoni_clean = "Gelen (Girdi)" if "Gelen" in islem_yoni else "Giden (Çıktı)"
+
+yuklenen_dosya = st.file_uploader("📸 Dekont Görseli Sürükleyip Bırakın", type=["png", "jpg", "jpeg"])
 
 if yuklenen_dosya is not None:
-    if "son_islenen" not in st.session_state or st.session_state.son_islenen != yuklenen_dosya.name:
-        with st.spinner("🔍 Görsel üzerindeki yazılar Tesseract OCR ile taranıyor..."):
+    if "son_dosya_v3" not in st.session_state or st.session_state.son_dosya_v3 != yuklenen_dosya.name:
+        with st.spinner("🔍 Dekont taranıyor..."):
             try:
                 img = Image.open(yuklenen_dosya)
-                # Gerçek OCR Okuma
                 okunan_metin = pytesseract.image_to_string(img, lang="tur")
-                
-                if not okunan_metin.strip():
-                    st.error("❌ Görselden hiçbir metin okunamadı. Lütfen resmin net ve okunabilir olduğundan emin olun.")
-                else:
-                    veri = metinden_veri_ayikla(okunan_metin)
-                    
-                    # Veritabanına Gerçek Veriyi Ekle
+                if okunan_metin.strip():
+                    veri = metinden_veri_ayikla(okunan_metin, yon=islem_yoni_clean)
                     cursor.execute(
-                        "INSERT INTO dekontlar (tarih, saat, gonderen, alici, banka, iban, tutar, raw_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (veri["tarih"], veri["saat"], veri["gonderen"], veri["alici"], veri["banka"], veri["iban"], veri["tutar"], okunan_metin)
+                        "INSERT INTO dekontlar (tarih, saat, islem_yoni, gonderen, alici, banka, iban, tutar, raw_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (veri["tarih"], veri["saat"], veri["islem_yoni"], veri["gonderen"], veri["alici"], veri["banka"], veri["iban"], veri["tutar"], okunan_metin)
                     )
                     conn.commit()
-                    st.session_state.son_islenen = yuklenen_dosya.name
-                    st.success(f"✅ Dekont Taranıp Kaydedildi! Tutar: {veri['tutar']:,.2f} TL | IBAN: {veri['iban']}")
+                    st.session_state.son_dosya_v3 = yuklenen_dosya.name
+                    st.success(f"✅ Dekont İşlendi! ({veri['saat']} - {veri['tutar']:,.2f} TL)")
                     st.rerun()
-
             except Exception as e:
-                st.error(f"⚠️ Görsel okunurken bir sistem hatası oluştu: {str(e)}")
-                st.info("Lütfen GitHub deponuza 'packages.txt' dosyasını eklediğinizden ve Streamlit'in yeniden başlatıldığından emin olun.")
+                st.error(f"Hata: {str(e)}")
 
 st.divider()
 
-# --- VERİ LİSTELEME VE TOPLAMLAR ---
+# ---------------------------------------------------------
+# OTOMATİK 11:00 VE 19:00 HAZIR RAPOR PANELLERİ
+# ---------------------------------------------------------
+st.subheader("⏰ Bugünün Otomatik Saat Raporları (11:00 & 19:00)")
+
 df = pd.read_sql_query("SELECT * FROM dekontlar ORDER BY id DESC", conn)
+bugun_str = datetime.now().strftime("%Y-%m-%d")
+simdiki_saat = datetime.now().time()
 
 if not df.empty:
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Toplam Biriken Tutar", f"{df['tutar'].sum():,.2f} TL")
-    col2.metric("Okunan Dekont Sayısı", f"{len(df)} Adet")
-    col3.metric("Farklı IBAN Sayısı", f"{df['iban'].nunique()} Hesap")
-
-    st.subheader("📊 IBAN Bazlı Biriken Toplamlar")
-    iban_summary = df.groupby(['alici', 'banka', 'iban'])['tutar'].agg(['sum', 'count']).reset_index()
-    iban_summary.columns = ['Alıcı', 'Banka', 'IBAN No', 'Biriken Toplam (TL)', 'İşlem Adedi']
-    st.dataframe(iban_summary, use_container_width=True)
-
-    st.subheader("📋 Okunan Dekont Geçmişi")
-    st.dataframe(
-        df[['tarih', 'saat', 'gonderen', 'alici', 'banka', 'iban', 'tutar']], 
-        column_config={
-            "tutar": st.column_config.NumberColumn("Tutar (TL)", format="%.2f TL")
-        },
-        use_container_width=True
-    )
+    df_bugun = df[df['tarih'] == bugun_str].copy()
     
-    # Görselden Okunan Ham Metni İnceleme Alanı (Hata Kontrolü İçin)
-    with st.expander("🔍 Son Okunan Dekontların Ham Metin İçeriklerini Gör"):
-        st.dataframe(df[['id', 'gonderen', 'raw_text']], use_container_width=True)
+    # Saat Ayrıştırma
+    df_bugun['saat_obj'] = pd.to_datetime(df_bugun['saat'], format='%H:%M', errors='coerce').dt.time
+
+    # 1. SABAH 11:00 RAPORU (Saat 11:00 ve Öncesi)
+    df_11 = df_bugun[df_bugun['saat_obj'] <= time(11, 0)]
+    
+    # 2. AKŞAM 19:00 RAPORU (Saat 11:00 ile 19:00 Arası)
+    df_19 = df_bugun[(df_bugun['saat_obj'] > time(11, 0)) & (df_bugun['saat_obj'] <= time(19, 0))]
+
+    col_a, col_b = st.columns(2)
+
+    # ☀️ 11:00 Rapor Kartı
+    with col_a:
+        st.markdown('### ☀️ 11:00 Sabah Vardiya Raporu')
+        gelen_11 = df_11[df_11['islem_yoni'] == 'Gelen (Girdi)']['tutar'].sum()
+        giden_11 = df_11[df_11['islem_yoni'] == 'Giden (Çıktı)']['tutar'].sum()
+        
+        st.write(f"**Gelen:** {gelen_11:,.2f} TL | **Giden:** {giden_11:,.2f} TL | **İşlem:** {len(df_11)} Adet")
+        
+        if not df_11.empty:
+            excel_11 = excel_raporu_olustur(df_11, "11:00 Raporu")
+            st.download_button(
+                label="📥 11:00 Excel Raporunu İndir",
+                data=excel_11,
+                file_name=f"Dekont_Raporu_1100_{bugun_str}.xlsx",
+                mime="application/vnd.openpyxlformat-officedocument.spreadsheetml.sheet",
+                key="btn_11"
+            )
+        else:
+            st.info("Saat 11:00'e kadar henüz dekont kaydı girilmedi.")
+
+    # 🌙 19:00 Rapor Kartı
+    with col_b:
+        st.markdown('### 🌙 19:00 Akşam Vardiya Raporu')
+        gelen_19 = df_19[df_19['islem_yoni'] == 'Gelen (Girdi)']['tutar'].sum()
+        giden_19 = df_19[df_19['islem_yoni'] == 'Giden (Çıktı)']['tutar'].sum()
+        
+        st.write(f"**Gelen:** {gelen_19:,.2f} TL | **Giden:** {giden_19:,.2f} TL | **İşlem:** {len(df_19)} Adet")
+        
+        if not df_19.empty:
+            excel_19 = excel_raporu_olustur(df_19, "19:00 Raporu")
+            st.download_button(
+                label="📥 19:00 Excel Raporunu İndir",
+                data=excel_19,
+                file_name=f"Dekont_Raporu_1900_{bugun_str}.xlsx",
+                mime="application/vnd.openpyxlformat-officedocument.spreadsheetml.sheet",
+                key="btn_19"
+            )
+        else:
+            st.info("Saat 11:00 - 19:00 arasında henüz dekont kaydı girilmedi.")
+
+    st.divider()
+
+    # 📋 Tüm Kayıtlar
+    st.subheader("📋 Tüm Günlük Dekont Listesi")
+    df_display = df[['tarih', 'saat', 'islem_yoni', 'gonderen', 'alici', 'banka', 'iban', 'tutar']].copy()
+    df_display.columns = ['Tarih', 'Saat', 'İşlem Yönü', 'Gönderen', 'Alıcı', 'Banka', 'IBAN No', 'Tutar (TL)']
+    st.dataframe(df_display, use_container_width=True)
+
 else:
-    st.info("Henüz dekont yüklenmedi. Yukarıdaki alandan gerçek bir dekont görseli yükleyebilirsiniz.")
+    st.info("Henüz veritabanında kayıt yok. Dekont yüklediğinizde 11:00 ve 19:00 raporları otomatik oluşacaktır.")
